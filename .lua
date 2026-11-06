@@ -1,0 +1,414 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Stats = game:GetService("Stats")
+local TweenService = game:GetService("TweenService")
+
+local Player = Players.LocalPlayer
+local hook = getgenv and getgenv().hookfunction or hookfunction
+local HASH = "5455ef47-de02-4074-808c-8d82c2cd12ec"
+local byte, char, floor, bxor = string.byte, string.char, math.floor, bit32.bxor
+local captured, votes, key = {}, {}, nil
+local spamRunning = false
+local actualCPS, cpsCounter, lastCPSTime = 0, 0, tick()
+local currentPing, lastPingUpdate, PING_UPDATE_INTERVAL = 0, 0, 1.0
+local currentFPS = 60
+
+local WHITE = Color3.fromRGB(255, 255, 255)
+local BLACK = Color3.fromRGB(0, 0, 0)
+local BG = Color3.fromRGB(0, 0, 0)
+
+local function timestamp() return tostring(floor(workspace:GetServerTimeNow() * 100)) end
+
+local function ShowNotification(title, text, duration)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = duration or 3})
+    end)
+end
+
+local function GetPing()
+    local now = tick()
+    if now - lastPingUpdate > PING_UPDATE_INTERVAL then
+        lastPingUpdate = now
+        local ok, result = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+        currentPing = ok and result or 100
+    end
+    return currentPing
+end
+
+local function learn(token, stamp)
+    if #token ~= #stamp then return false end
+    for i = 1, #token do
+        local value = bxor(byte(token, i), (byte(stamp, i) + i) % 256)
+        local counts = votes[i] or {}
+        votes[i] = counts
+        counts[value] = (counts[value] or 0) + 1
+    end
+    local nextKey = {}
+    for i = 1, #token do
+        local best, highest = 0, -1
+        for value, count in pairs(votes[i]) do
+            if count > highest then best, highest = value, count end
+        end
+        nextKey[i] = best
+    end
+    key = nextKey
+    return true
+end
+
+local function makeToken()
+    if not key then return nil end
+    local stamp = timestamp()
+    local out = {}
+    for i = 1, #stamp do
+        local value = key[i] or key[#key]
+        if not value then return nil end
+        out[i] = char(bxor((byte(stamp, i) + i) % 256, value))
+    end
+    return table.concat(out)
+end
+
+local fire
+if hook then
+    pcall(function()
+        local template = Instance.new("RemoteEvent")
+        fire = hook(template.FireServer, function(self, ...)
+            local args = table.pack(...)
+            if args[1] ~= HASH or type(args[3]) ~= "string" then
+                return fire(self, ...)
+            end
+            captured = {remote = self, sessionKey = args[2], token = args[3], timing = args[4], tailBool = args[8]}
+            learn(args[3], timestamp())
+            if not _G.RuqwiriActivated then
+                _G.RuqwiriActivated = true
+                ShowNotification("Speechless.cc [Ap Macro]", "Ap Macro Activated", 4)
+            end
+            return fire(self, ...)
+        end)
+    end)
+end
+
+local camCache, pointsCache, pointsCacheTime, POINTS_TTL = nil, {}, 0, 0.05
+
+local function refreshPoints()
+    local now = tick()
+    if now - pointsCacheTime < POINTS_TTL then return end
+    pointsCacheTime = now
+    pointsCache = {}
+    local alive = workspace:FindFirstChild("Alive")
+    if alive and camCache then
+        for _, character in ipairs(alive:GetChildren()) do
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if root then
+                pointsCache[character.Name] = camCache:WorldToScreenPoint(root.Position)
+            end
+        end
+    end
+end
+
+local function replay()
+    if not fire or not captured.remote or not captured.sessionKey then return end
+    local token = makeToken()
+    if not token then return end
+    camCache = workspace.CurrentCamera
+    if not camCache then return end
+    refreshPoints()
+    
+    local centerX = camCache.ViewportSize.X / 2
+    local centerY = camCache.ViewportSize.Y / 2
+    
+    fire(captured.remote, HASH, captured.sessionKey, token, captured.timing or 0.5, camCache.CFrame, pointsCache, {centerX, centerY}, captured.tailBool or false)
+    cpsCounter = cpsCounter + 1
+end
+
+local function Parry()
+    if captured.remote and captured.sessionKey then
+        replay()
+    end
+end
+
+local SwordAPI = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("SwordAPI")
+local AnimFix_Cache, Loaded_Tracks, LastPlayedTrack = {}, {}, nil
+local swordAnimationState = {
+    active = nil,
+    cache = {},
+    tracks = {},
+    api = nil,
+    generation = 0,
+    last_spam = 0,
+    cancel_delay = 0.12,
+    cancel_fraction = 0.35,
+}
+
+pcall(function()
+    swordAnimationState.api = require(ReplicatedStorage.Shared.SwordAPI)
+end)
+
+local function GetParryAnimation(swordName)
+    local defaultAnim = SwordAPI.Collection.Default:FindFirstChild("GrabParry")
+    if not swordName or swordName == "" then return defaultAnim end
+    if AnimFix_Cache[swordName] then return AnimFix_Cache[swordName] end
+    local ok, swordData = pcall(function()
+        return ReplicatedStorage.Shared.ReplicatedInstances.Swords.GetSword:Invoke(swordName)
+    end)
+    if not ok or type(swordData) ~= "table" or not swordData.AnimationType then
+        AnimFix_Cache[swordName] = defaultAnim
+        return defaultAnim
+    end
+    for _, obj in pairs(SwordAPI.Collection:GetChildren()) do
+        if obj.Name == swordData.AnimationType then
+            local anim = obj:FindFirstChild("GrabParry") or obj:FindFirstChild("Grab")
+            if anim then AnimFix_Cache[swordName] = anim return anim end
+        end
+    end
+    AnimFix_Cache[swordName] = defaultAnim
+    return defaultAnim
+end
+
+local function GetOrLoadTrack()
+    local char = Player.Character
+    if not char then return nil end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return nil end
+    local animator = humanoid:FindFirstChild("Animator")
+    if not animator then return nil end
+    local currentSword = char:GetAttribute("CurrentlyEquippedSword") or "Default"
+    if Loaded_Tracks.Character ~= char then
+        Loaded_Tracks = {Character = char}
+        LastPlayedTrack = nil
+        swordAnimationState.active = nil
+        swordAnimationState.tracks = {}
+    end
+    if Loaded_Tracks[currentSword] then return Loaded_Tracks[currentSword] end
+    local animation = GetParryAnimation(currentSword)
+    if not animation then return nil end
+    local ok, track = pcall(function() return animator:LoadAnimation(animation) end)
+    if ok and track then
+        track.Priority = Enum.AnimationPriority.Action4
+        track.Looped = false
+        for k, v in animation:GetAttributes() do track:SetAttribute(k, v) end
+        track:SetAttribute("GrabParry", true)
+        Loaded_Tracks[currentSword] = track
+        return track
+    end
+    return nil
+end
+
+local function PlayGrabParry(force)
+    local char = Player.Character
+    if not char then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if not humanoid or not animator then return end
+    
+    local currentSword = char:GetAttribute("CurrentlyEquippedSword") or "Base Sword"
+    local track = GetOrLoadTrack()
+    if not track then return end
+    
+    local t = tick()
+    if force then
+        if t - swordAnimationState.last_spam < swordAnimationState.cancel_delay then
+            if swordAnimationState.active and swordAnimationState.active.IsPlaying then
+                char:SetAttribute("ParryTime", math.max(char:GetAttribute("ParryTime") or 0, swordAnimationState.active.Length ~= 0 and swordAnimationState.active.Length or 1))
+                return
+            end
+        end
+        swordAnimationState.last_spam = t
+    end
+    
+    swordAnimationState.generation = swordAnimationState.generation + 1
+    local generation = swordAnimationState.generation
+    
+    for _, tr in animator:GetPlayingAnimationTracks() do
+        if tr:GetAttribute("GrabParry") or tr:GetAttribute("Parry") or tr:GetAttribute("SuccessParry") then
+            pcall(tr.Stop, tr, tr:GetAttribute("StopFadeTime") or 0.05)
+        end
+    end
+    
+    local animObj = track.Animation
+    local fadeIn = animObj:GetAttribute("PlayFadeTime") or 0.05
+    local weight = animObj:GetAttribute("PlayWeight") or 1
+    local speed = animObj:GetAttribute("PlaySpeed") or 1
+    
+    track.TimePosition = 0
+    track:Play(fadeIn, weight, speed)
+    swordAnimationState.active = track
+    char:SetAttribute("ParryTime", math.max(char:GetAttribute("ParryTime") or 0, track.Length ~= 0 and (track.Length - track.TimePosition) * speed or 1))
+    
+    if force then
+        local length = track.Length or 0
+        local delay = math.min(swordAnimationState.cancel_delay, length * swordAnimationState.cancel_fraction)
+        if delay < 0.05 then delay = 0.05 end
+        local thisTrack = track
+        local stopFade = animObj:GetAttribute("StopFadeTime") or 0.05
+        task.delay(delay, function()
+            if generation ~= swordAnimationState.generation or swordAnimationState.active ~= thisTrack then return end
+            pcall(thisTrack.Stop, thisTrack, stopFade)
+        end)
+    end
+end
+
+pcall(function()
+    ReplicatedStorage.Remotes.ParrySuccessAll.OnClientEvent:Connect(function()
+        local char = Player.Character
+        if not char then return end
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+        local animator = humanoid:FindFirstChild("Animator")
+        if not animator then return end
+        for _, track in pairs(animator:GetPlayingAnimationTracks()) do
+            if track.Name == "GrabParry" or track.Name == "Grab" then
+                pcall(function() track:Stop(0.1) end)
+            end
+        end
+        LastPlayedTrack = nil
+    end)
+end)
+
+local spamThreads = {}
+local SPAM_THREAD_COUNT = 11
+
+local function SpamThread()
+    while spamRunning do
+        Parry()
+        PlayGrabParry(true)
+        task.wait(0)
+    end
+end
+
+local function StartSpam()
+    if spamRunning then return end
+    spamRunning = true
+    for i = 1, SPAM_THREAD_COUNT do
+        local th = task.spawn(SpamThread)
+        table.insert(spamThreads, th)
+    end
+end
+
+local function StopSpam()
+    spamRunning = false
+    for _, th in ipairs(spamThreads) do
+        pcall(function() task.cancel(th) end)
+    end
+    spamThreads = {}
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SpeechlessAPMacro"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = Player:WaitForChild("PlayerGui")
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 260, 0, 300)
+MainFrame.Position = UDim2.new(0.5, -130, 0.5, -150)
+MainFrame.BackgroundColor3 = BLACK
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, 0, 0, 40)
+Title.BackgroundColor3 = BLACK
+Title.BorderSizePixel = 0
+Title.Text = "Speechless.cc"
+Title.TextColor3 = WHITE
+Title.TextSize = 16
+Title.Font = Enum.Font.GothamBold
+Title.TextXAlignment = Enum.TextXAlignment.Center
+Title.Parent = MainFrame
+
+local SubTitle = Instance.new("TextLabel")
+SubTitle.Size = UDim2.new(1, 0, 0, 20)
+SubTitle.Position = UDim2.new(0, 0, 0, 40)
+SubTitle.BackgroundColor3 = BLACK
+SubTitle.BorderSizePixel = 0
+SubTitle.Text = "Ap Macro"
+SubTitle.TextColor3 = Color3.fromRGB(150, 150, 150)
+SubTitle.TextSize = 12
+SubTitle.Font = Enum.Font.Gotham
+SubTitle.TextXAlignment = Enum.TextXAlignment.Center
+SubTitle.Parent = MainFrame
+
+local Line = Instance.new("Frame")
+Line.Size = UDim2.new(1, -20, 0, 1)
+Line.Position = UDim2.new(0, 10, 0, 60)
+Line.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+Line.BorderSizePixel = 0
+Line.Parent = MainFrame
+
+local ContentFrame = Instance.new("Frame")
+ContentFrame.Size = UDim2.new(1, -20, 1, -110)
+ContentFrame.Position = UDim2.new(0, 10, 0, 70)
+ContentFrame.BackgroundTransparency = 1
+ContentFrame.BorderSizePixel = 0
+ContentFrame.Parent = MainFrame
+
+local ListLayout = Instance.new("UIListLayout")
+ListLayout.Padding = UDim.new(0, 5)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+ListLayout.Parent = ContentFrame
+
+local function CreateButton(name, order, callback)
+    local btn = Instance.new("TextButton")
+    btn.Name = name .. "Btn"
+    btn.Size = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = WHITE
+    btn.BorderSizePixel = 0
+    btn.Text = name .. ": OFF"
+    btn.TextColor3 = BLACK
+    btn.TextSize = 12
+    btn.Font = Enum.Font.GothamBold
+    btn.LayoutOrder = order
+    btn.Parent = ContentFrame
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = btn
+    
+    local state = false
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.Text = name .. ": " .. (state and "ON" or "OFF")
+        btn.BackgroundColor3 = state and BLACK or WHITE
+        btn.TextColor3 = state and WHITE or BLACK
+        if callback then callback(state) end
+    end)
+    return btn
+end
+
+local SpamBtn = CreateButton("Spam", 1, function(state)
+    if state then StartSpam() else StopSpam() end
+end)
+
+local KeyLabel = Instance.new("TextLabel")
+KeyLabel.Size = UDim2.new(1, 0, 0, 30)
+KeyLabel.Position = UDim2.new(0, 0, 1, -35)
+KeyLabel.BackgroundTransparency = 1
+KeyLabel.Text = "Key: E"
+KeyLabel.TextColor3 = WHITE
+KeyLabel.TextSize = 14
+KeyLabel.Font = Enum.Font.GothamBold
+KeyLabel.TextXAlignment = Enum.TextXAlignment.Center
+KeyLabel.Parent = MainFrame
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.KeyCode == Enum.KeyCode.E then 
+        if spamRunning then
+            StopSpam()
+            SpamBtn.Text = "Spam: OFF"
+            SpamBtn.BackgroundColor3 = WHITE
+            SpamBtn.TextColor3 = BLACK
+        else
+            StartSpam()
+            SpamBtn.Text = "Spam: ON"
+            SpamBtn.BackgroundColor3 = BLACK
+            SpamBtn.TextColor3 = WHITE
+        end
+    end
+end)
+
+ShowNotification("Speechless.cc [Ap Macro]", "E = Spam toggle | Сделай 1 ручной паринг", 5)
